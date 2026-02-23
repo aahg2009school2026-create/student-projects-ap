@@ -17,7 +17,7 @@ import io
 # 0. إعداد المجلد الرئيسي
 # ===========================
 
-PARENT_FOLDER_ID = "1gkMhBfFAoJMeAzqE4be1GsNAmWORPycg"
+PARENT_FOLDER_ID = "1zfUMHEDA5Nyo2oohMQ5G0z0SBW9NmYQJ"
 
 # ===========================
 # 1. إعداد الاتصالات
