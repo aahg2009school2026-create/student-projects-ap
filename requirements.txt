@@ -1,6 +1,9 @@
-streamlit==1.31.0
-supabase==2.3.4
-google-api-python-client==2.116.0
-google-auth==2.27.0
-google-auth-oauthlib==1.2.0
-google-auth-httplib2==0.2.0
+streamlit==1.29.0
+supabase==1.0.4
+google-api-python-client==2.100.0
+google-auth==2.23.0
+google-auth-oauthlib==1.1.0
+google-auth-httplib2==0.1.1
+protobuf==4.24.4
+httpx==0.24.1
+postgrest-py==0.10.8
