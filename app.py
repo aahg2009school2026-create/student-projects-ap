@@ -1,17 +1,22 @@
 """
-تطبيق رفع مشاريع الطلاب
-نظام ديناميكي متكامل يستخدم Streamlit + Supabase + Google Drive
+تطبيق رفع مشاريع الطلاب - النسخة النهائية المعتمدة
+نظام متكامل يستخدم Streamlit + Supabase + Google Drive
 """
 
 import streamlit as st
 from supabase import create_client, Client
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaIoBaseUpload
 import json
 import os
 from datetime import datetime
 import io
+
+# ===========================
+# 0. إعدادات المجلد الرئيسي (تم التحديث بمعرف المجلد الخاص بك)
+# ===========================
+PARENT_FOLDER_ID = "1gkMhBfFAoJMeAzqE4be1GsNAmWORPycg"
 
 # ===========================
 # 1. إعداد الاتصالات
@@ -21,14 +26,13 @@ import io
 def init_supabase() -> Client:
     """إنشاء اتصال مع Supabase"""
     try:
-        # محاولة القراءة من Environment Variables أولاً (Render, Railway, etc.)
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_KEY")
+        # محاولة القراءة من Environment Variables (Render) أو st.secrets
+        url = os.getenv("SUPABASE_URL") or st.secrets.get("supabase", {}).get("url")
+        key = os.getenv("SUPABASE_KEY") or st.secrets.get("supabase", {}).get("key")
         
-        # إذا لم توجد، اقرأ من st.secrets (Streamlit Cloud)
         if not url or not key:
-            url = st.secrets["supabase"]["url"]
-            key = st.secrets["supabase"]["key"]
+            st.error("⚠️ لم يتم العثور على إعدادات Supabase (URL/KEY)")
+            st.stop()
         
         return create_client(url, key)
     except Exception as e:
@@ -39,25 +43,20 @@ def init_supabase() -> Client:
 def init_google_drive():
     """إنشاء اتصال مع Google Drive API"""
     try:
-        # محاولة القراءة من Environment Variables
         credentials_json = os.getenv("GOOGLE_CREDENTIALS")
         
         if credentials_json:
-            # إذا كانت string، حوّلها لـ dict
+            # إذا كان النص يبدأ بـ ' أو " فقم بتنظيفه (شائع في Render)
             credentials_dict = json.loads(credentials_json)
         else:
-            # اقرأ من st.secrets
             credentials_dict = dict(st.secrets["google_credentials"])
         
-        # إنشاء credentials
         credentials = service_account.Credentials.from_service_account_info(
             credentials_dict,
             scopes=['https://www.googleapis.com/auth/drive.file']
         )
         
-        # بناء خدمة Drive
-        service = build('drive', 'v3', credentials=credentials)
-        return service
+        return build('drive', 'v3', credentials=credentials)
     except Exception as e:
         st.error(f"خطأ في الاتصال بـ Google Drive: {str(e)}")
         st.stop()
@@ -67,309 +66,182 @@ def init_google_drive():
 # ===========================
 
 def get_system_config(supabase: Client):
-    """جلب إعدادات النظام (السنة والفصل الحالي)"""
     try:
         response = supabase.table('system_config').select('*').limit(1).execute()
-        if response.data and len(response.data) > 0:
-            return response.data[0]
-        else:
-            st.error("لم يتم العثور على إعدادات النظام في قاعدة البيانات")
-            return None
+        return response.data[0] if response.data else None
     except Exception as e:
         st.error(f"خطأ في جلب إعدادات النظام: {str(e)}")
         return None
 
 def get_classes(supabase: Client):
-    """جلب قائمة المراحل والشعب"""
     try:
-        response = supabase.table('classes').select('*').order('grade_level').execute()
+        response = supabase.table('classes').select('*').execute()
         return response.data
     except Exception as e:
         st.error(f"خطأ في جلب قائمة الصفوف: {str(e)}")
         return []
 
 def save_submission(supabase: Client, data: dict):
-    """حفظ بيانات التسليم في قاعدة البيانات"""
     try:
-        response = supabase.table('submissions').insert(data).execute()
-        return response.data
+        supabase.table('submissions').insert(data).execute()
     except Exception as e:
-        raise Exception(f"فشل حفظ البيانات: {str(e)}")
+        raise Exception(f"فشل حفظ البيانات في قاعدة البيانات: {str(e)}")
 
 # ===========================
-# 3. دوال Google Drive
+# 3. دوال Google Drive (منطق المجلدات والرفع)
 # ===========================
 
-def find_or_create_folder(service, folder_name: str, parent_id: str = None):
-    """
-    البحث عن مجلد أو إنشاؤه إذا لم يكن موجوداً
-    """
+def find_or_create_folder(service, folder_name: str, parent_id: str):
+    """البحث عن مجلد أو إنشاؤه داخل مجلد أب محدد"""
     try:
-        # البحث عن المجلد
-        query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'"
-        if parent_id:
-            query += f" and '{parent_id}' in parents"
-        
-        results = service.files().list(
-            q=query,
-            spaces='drive',
-            fields='files(id, name)',
-            pageSize=1
-        ).execute()
-        
+        query = f"name='{folder_name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        results = service.files().list(q=query, fields='files(id)').execute()
         files = results.get('files', [])
         
         if files:
             return files[0]['id']
         else:
-            # إنشاء مجلد جديد
             file_metadata = {
                 'name': folder_name,
-                'mimeType': 'application/vnd.google-apps.folder'
+                'mimeType': 'application/vnd.google-apps.folder',
+                'parents': [parent_id]
             }
-            if parent_id:
-                file_metadata['parents'] = [parent_id]
-            
-            folder = service.files().create(
-                body=file_metadata,
-                fields='id'
-            ).execute()
-            
+            folder = service.files().create(body=file_metadata, fields='id').execute()
             return folder['id']
     except Exception as e:
-        raise Exception(f"خطأ في إنشاء/البحث عن المجلد '{folder_name}': {str(e)}")
+        raise Exception(f"خطأ في إدارة المجلد '{folder_name}': {str(e)}")
 
-def create_folder_structure(service, year: str, semester: str, grade: str, section: str):
-    """
-    إنشاء هيكلة المجلدات: Year > Semester > Grade > Section
-    """
-    try:
-        # 1. مجلد السنة
-        year_folder_id = find_or_create_folder(service, year)
-        
-        # 2. مجلد الفصل
-        semester_folder_id = find_or_create_folder(service, semester, year_folder_id)
-        
-        # 3. مجلد المرحلة
-        grade_folder_id = find_or_create_folder(service, grade, semester_folder_id)
-        
-        # 4. مجلد الشعبة
-        section_folder_id = find_or_create_folder(service, section, grade_folder_id)
-        
-        return section_folder_id
-    except Exception as e:
-        raise Exception(f"خطأ في إنشاء هيكلة المجلدات: {str(e)}")
+def create_full_structure(service, year, semester, grade, section):
+    """إنشاء هيكلة المجلدات الأربعة داخل المجلد الرئيسي المشترك"""
+    year_id = find_or_create_folder(service, year, PARENT_FOLDER_ID)
+    sem_id = find_or_create_folder(service, semester, year_id)
+    grade_id = find_or_create_folder(service, grade, sem_id)
+    section_id = find_or_create_folder(service, section, grade_id)
+    return section_id
 
-def upload_file_to_drive(service, file_content, file_name: str, folder_id: str):
-    """
-    رفع ملف إلى Google Drive
-    """
+def upload_to_drive(service, file_content, file_name, folder_id):
+    """رفع الملف الفعلي ومنح صلاحيات الوصول"""
     try:
-        from googleapiclient.http import MediaInMemoryUpload
+        file_metadata = {'name': file_name, 'parents': [folder_id]}
+        media = MediaIoBaseUpload(io.BytesIO(file_content), mimetype='application/pdf', resumable=True)
         
-        file_metadata = {
-            'name': file_name,
-            'parents': [folder_id]
-        }
-        
-        # استخدام MediaInMemoryUpload بدلاً من MediaFileUpload
-        media = MediaInMemoryUpload(
-            file_content,
-            mimetype='application/pdf',
-            resumable=True
-        )
-        
-        file = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, webViewLink'
+        file_drive = service.files().create(
+            body=file_metadata, media_body=media, fields='id, webViewLink'
         ).execute()
         
-        # جعل الملف قابل للعرض لأي شخص لديه الرابط
+        # منح صلاحية العرض لأي شخص لديه الرابط
         service.permissions().create(
-            fileId=file['id'],
+            fileId=file_drive['id'],
             body={'type': 'anyone', 'role': 'reader'}
         ).execute()
         
-        return file.get('webViewLink')
+        return file_drive.get('webViewLink')
     except Exception as e:
-        raise Exception(f"فشل رفع الملف: {str(e)}")
+        raise Exception(f"فشل الرفع إلى درايف: {str(e)}")
 
 # ===========================
-# 4. واجهة Streamlit
+# 4. واجهة Streamlit الرئيسيّة
 # ===========================
 
 def main():
-    # إعداد الصفحة
-    st.set_page_config(
-        page_title="نظام رفع المشاريع الطلابية",
-        page_icon="📚",
-        layout="centered"
-    )
+    st.set_page_config(page_title="نظام رفع المشاريع", page_icon="📚", layout="centered")
     
-    # تهيئة الاتصالات
     supabase = init_supabase()
     drive_service = init_google_drive()
-    
-    # جلب إعدادات النظام
     config = get_system_config(supabase)
+    
     if not config:
+        st.error("لا يمكن تحميل إعدادات النظام. تأكد من جدول system_config.")
         st.stop()
-    
-    current_year = config['current_year']
-    current_semester = config['current_semester']
-    
-    # العنوان الرئيسي
+        
     st.title("📚 نظام رفع المشاريع الطلابية")
-    st.markdown(f"### السنة الدراسية: **{current_year}** | الفصل: **{current_semester}**")
+    st.markdown(f"### السنة الدراسية: **{config['current_year']}** | الفصل: **{config['current_semester']}**")
     st.markdown("---")
+
+    # جلب وترتيب الصفوف
+    classes_data = get_classes(supabase)
     
-    # جلب قائمة الصفوف
-    classes = get_classes(supabase)
-    if not classes:
-        st.error("لا توجد صفوف مسجلة في النظام")
-        st.stop()
+    # منطق الترتيب المطلوب
+    grade_priority = {
+        "أول متوسط": 1, "ثاني متوسط": 2, "ثالث متوسط": 3,
+        "أول ثانوي": 4, "ثاني ثانوي": 5, "ثالث ثانوي": 6
+    }
     
-    # تجهيز البيانات للقوائم المنسدلة
-    grades = sorted(list(set([c['grade_level'] for c in classes])))
-    
-    # نموذج الإدخال
-    with st.form("submission_form"):
-        st.subheader("📝 معلومات الطالب والمشروع")
+    all_grades = sorted(list(set([c['grade_level'] for c in classes_data])), 
+                        key=lambda x: grade_priority.get(x, 99))
+
+    # واجهة النموذج
+    with st.form("main_form"):
+        st.subheader("📝 بيانات المشروع")
         
-        # اختيار المرحلة
-        selected_grade = st.selectbox(
-            "اختر المرحلة الدراسية",
-            grades,
-            help="اختر المرحلة التي تنتمي إليها"
-        )
+        # اختيار المرحلة (مع خيار افتراضي غير محدد)
+        selected_grade = st.selectbox("اختر المرحلة الدراسية", ["-- اختر المرحلة --"] + all_grades)
         
-        # تصفية الشعب بناءً على المرحلة المختارة
-        sections = [c['section_name'] for c in classes if c['grade_level'] == selected_grade]
+        # تصفية الشعب بناءً على المرحلة
+        available_sections = ["-- اختر الشعبة --"]
+        if selected_grade != "-- اختر المرحلة --":
+            available_sections += [c['section_name'] for c in classes_data if c['grade_level'] == selected_grade]
+            
+        selected_section = st.selectbox("اختر الشعبة", available_sections)
         
-        # اختيار الشعبة
-        selected_section = st.selectbox(
-            "اختر الشعبة",
-            sections,
-            help="اختر شعبتك الدراسية"
-        )
+        student_name = st.text_input("اسم الطالب الثلاثي", placeholder="أدخل اسمك الكامل")
+        project_title = st.text_input("عنوان المشروع", placeholder="عنوان بحثك أو مشروعك")
         
-        # اسم الطالب
-        student_name = st.text_input(
-            "اسم الطالب الثلاثي",
-            placeholder="مثال: أحمد محمد علي",
-            help="أدخل الاسم الكامل باللغة العربية"
-        )
+        uploaded_file = st.file_uploader("ارفع ملف المشروع (PDF فقط)", type=['pdf'])
         
-        # عنوان المشروع
-        project_title = st.text_input(
-            "عنوان المشروع",
-            placeholder="مثال: الطاقة المتجددة ومستقبلها",
-            help="أدخل عنوان المشروع بشكل واضح"
-        )
-        
-        # رفع الملف
-        uploaded_file = st.file_uploader(
-            "اختر ملف المشروع (PDF فقط)",
-            type=['pdf'],
-            help="الحد الأقصى لحجم الملف: 10 MB"
-        )
-        
-        # زر الإرسال
-        submitted = st.form_submit_button("🚀 رفع المشروع", use_container_width=True)
-    
-    # معالجة الإرسال
-    if submitted:
-        # التحقق من صحة البيانات
-        errors = []
-        
-        if not student_name or len(student_name.strip()) < 6:
-            errors.append("⚠️ يجب إدخال اسم الطالب الثلاثي (6 أحرف على الأقل)")
-        
-        if not project_title or len(project_title.strip()) < 5:
-            errors.append("⚠️ يجب إدخال عنوان المشروع (5 أحرف على الأقل)")
-        
-        if uploaded_file is None:
-            errors.append("⚠️ يجب اختيار ملف PDF للمشروع")
-        
-        if uploaded_file and uploaded_file.size > 10 * 1024 * 1024:
-            errors.append("⚠️ حجم الملف يتجاوز الحد المسموح (10 MB)")
-        
-        # عرض الأخطاء
-        if errors:
-            for error in errors:
-                st.error(error)
+        submit_btn = st.form_submit_button("🚀 إرسال ورفع المشروع", use_container_width=True)
+
+    # معالجة ضغط الزر
+    if submit_btn:
+        # التحقق من المدخلات
+        if selected_grade == "-- اختر المرحلة --" or selected_section == "-- اختر الشعبة --":
+            st.warning("⚠️ فضلاً اختر المرحلة والشعبة")
+        elif not student_name or len(student_name) < 6:
+            st.warning("⚠️ يرجى كتابة اسم الطالب الثلاثي بشكل صحيح")
+        elif not project_title:
+            st.warning("⚠️ يرجى كتابة عنوان المشروع")
+        elif not uploaded_file:
+            st.warning("⚠️ يرجى إرفاق ملف الـ PDF")
         else:
-            # بدء عملية الرفع
-            with st.spinner("جاري رفع المشروع... الرجاء الانتظار"):
+            with st.spinner("جاري العمل على رفع مشروعك..."):
                 try:
-                    # 1. إنشاء هيكلة المجلدات في Drive
-                    folder_id = create_folder_structure(
-                        drive_service,
-                        current_year,
-                        current_semester,
-                        selected_grade,
+                    # 1. إنشاء المسار في درايف
+                    target_folder_id = create_full_structure(
+                        drive_service, 
+                        config['current_year'], 
+                        config['current_semester'], 
+                        selected_grade, 
                         selected_section
                     )
                     
-                    # 2. تجهيز اسم الملف
-                    safe_student_name = student_name.replace(" ", "_")
-                    file_name = f"{safe_student_name}_{project_title[:30]}.pdf"
-                    
-                    # 3. رفع الملف إلى Drive
+                    # 2. تحضير الملف والرفع
                     file_content = uploaded_file.read()
-                    file_url = upload_file_to_drive(
-                        drive_service,
-                        file_content,
-                        file_name,
-                        folder_id
-                    )
+                    safe_name = student_name.strip().replace(" ", "_")
+                    final_filename = f"{safe_name}_{datetime.now().strftime('%H%M%S')}.pdf"
                     
-                    # 4. حفظ البيانات في قاعدة البيانات
-                    submission_data = {
+                    drive_link = upload_to_drive(drive_service, file_content, final_filename, target_folder_id)
+                    
+                    # 3. الحفظ في قاعدة البيانات
+                    save_submission(supabase, {
                         'student_name': student_name.strip(),
                         'project_title': project_title.strip(),
-                        'file_url': file_url,
+                        'file_url': drive_link,
                         'grade_level': selected_grade,
                         'section': selected_section,
-                        'year': current_year,
-                        'semester': current_semester,
+                        'year': config['current_year'],
+                        'semester': config['current_semester'],
                         'timestamp': datetime.now().isoformat()
-                    }
+                    })
                     
-                    save_submission(supabase, submission_data)
-                    
-                    # 5. عرض رسالة النجاح
-                    st.success("✅ تم رفع المشروع بنجاح!")
+                    st.success("🎉 تم استلام مشروعك ورفعه بنجاح!")
                     st.balloons()
-                    
-                    # عرض تفاصيل التسليم
-                    st.info(f"""
-                    **تفاصيل التسليم:**
-                    - **الطالب:** {student_name}
-                    - **المشروع:** {project_title}
-                    - **المرحلة:** {selected_grade}
-                    - **الشعبة:** {selected_section}
-                    - **التاريخ:** {datetime.now().strftime('%Y-%m-%d %H:%M')}
-                    """)
-                    
-                    # رابط الملف
-                    st.markdown(f"[🔗 عرض الملف في Google Drive]({file_url})")
+                    st.info(f"يمكنك معاينة ملفك من هنا: [رابط المشروع]({drive_link})")
                     
                 except Exception as e:
-                    st.error(f"❌ حدث خطأ أثناء رفع المشروع: {str(e)}")
-                    st.warning("لم يتم حفظ البيانات. الرجاء المحاولة مرة أخرى.")
-    
-    # ملاحظات في الأسفل
-    st.markdown("---")
-    st.caption("💡 **ملاحظات:**")
-    st.caption("• تأكد من رفع ملفات PDF فقط")
-    st.caption("• الحد الأقصى لحجم الملف: 10 ميجابايت")
-    st.caption("• سيتم حفظ المشروع في Google Drive تلقائياً")
+                    st.error(f"❌ حدث خطأ غير متوقع: {str(e)}")
 
-# ===========================
-# 5. تشغيل التطبيق
-# ===========================
+    st.markdown("---")
+    st.caption("نظام الرفع الأكاديمي الموحد - جميع الحقوق محفوظة")
 
 if __name__ == "__main__":
     main()
