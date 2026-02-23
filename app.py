@@ -165,14 +165,16 @@ def upload_file_to_drive(service, file_content, file_name: str, folder_id: str):
     رفع ملف إلى Google Drive
     """
     try:
+        from googleapiclient.http import MediaInMemoryUpload
+        
         file_metadata = {
             'name': file_name,
             'parents': [folder_id]
         }
         
-        # إنشاء ملف مؤقت في الذاكرة
-        media = MediaFileUpload(
-            io.BytesIO(file_content),
+        # استخدام MediaInMemoryUpload بدلاً من MediaFileUpload
+        media = MediaInMemoryUpload(
+            file_content,
             mimetype='application/pdf',
             resumable=True
         )
