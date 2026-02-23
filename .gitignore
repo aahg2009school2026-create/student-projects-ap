@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Secrets - لا ترفع هذه الملفات أبداً!
+*.json
+credentials.json
+service-account.json
+google-credentials.json
+secrets.toml
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# System
+.DS_Store
+Thumbs.db
+
+# Test files
+test_uploads/
+*.pdf
+*.docx
+
+# Logs
+*.log
